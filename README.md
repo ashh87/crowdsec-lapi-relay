@@ -98,7 +98,10 @@ real `crowdsec` agents tailing syslog files, each with its own machine ID:
   limits) and run as non-root with a named volume; a queued batch was written.
 - `systemd-analyze verify` passes on the unit. TLS listener: checked with `curl` only.
 - Unit tests (`go test -race ./...`) against a mock LAPI cover the cases above, plus poison
-  batches, upstream token expiry, queue limits, per-LAPI credentials and config validation.
+  batches, upstream token expiry, queue limits (file count, age and total size), queues left over
+  from removed agents or LAPIs, per-LAPI credentials and config validation. The size limit and
+  the leftover-queue check were only unit-tested; the integration run doesn't fill a queue or
+  rename anything.
 
 **Not tested / assumed:**
 - Packaged agents (container images, appliance add-ons). They run the same `crowdsec` binary
