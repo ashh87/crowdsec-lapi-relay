@@ -1,0 +1,38 @@
+[Unit]
+Description=CrowdSec LAPI relay (fan-out with disk queue)
+Wants=network-online.target
+After=network-online.target
+# If the LAPIs are reached over a VPN, also order after its unit, e.g. in a drop-in.
+
+[Service]
+ExecStartPre=/usr/local/bin/lapi-relay -c /etc/lapi-relay/config.json -check
+ExecStart=/usr/local/bin/lapi-relay -c /etc/lapi-relay/config.json
+Restart=on-failure
+RestartSec=5s
+# Queue drain on stop is bounded by shutdown_grace; leave headroom.
+TimeoutStopSec=30s
+
+# useradd --system --no-create-home --shell /usr/sbin/nologin lapi-relay
+# Config and password files: root:lapi-relay, mode 0640.
+User=lapi-relay
+Group=lapi-relay
+StateDirectory=lapi-relay
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

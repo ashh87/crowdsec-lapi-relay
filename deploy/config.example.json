@@ -1,0 +1,27 @@
+{
+  "listen": "127.0.0.1:8081",
+  "queue_dir": "/var/lib/lapi-relay",
+  "max_queue_files": 10000,
+  "max_queue_age": "168h",
+  "token_ttl": "1h",
+  "shutdown_grace": "10s",
+
+  "agents": [
+    {
+      "login": "agent-1",
+      "password_file": "/etc/lapi-relay/agent-1.password"
+    },
+    {
+      "login": "agent-2",
+      "password_file": "/etc/lapi-relay/agent-2.password",
+      "upstream": {
+        "lapi-b": {"login": "agent-2-alt", "password_file": "/etc/lapi-relay/agent-2.lapi-b.password"}
+      }
+    }
+  ],
+
+  "lapis": [
+    {"name": "lapi-a", "url": "http://lapi-a.example.internal:8080/"},
+    {"name": "lapi-b", "url": "https://lapi-b.example.internal:8080/", "ca_file": "/etc/lapi-relay/lapi-b-ca.pem"}
+  ]
+}
