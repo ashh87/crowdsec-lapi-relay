@@ -21,11 +21,14 @@ import (
 // others in place.
 
 type spool struct {
-	dir string
-	seq atomic.Uint64
+	dir      string
+	seq      atomic.Uint64
+	maxBytes int64
+	queues   []*queue // every configured queue, for maxBytes
+	evictMu  sync.Mutex
 }
 
-func newSpool(dir string) (*spool, error) {
+func newSpool(dir string, maxBytes int64) (*spool, error) {
 	if err := os.MkdirAll(filepath.Join(dir, "tmp"), 0o700); err != nil {
 		return nil, err
 	}
@@ -35,7 +38,7 @@ func newSpool(dir string) (*spool, error) {
 			os.Remove(filepath.Join(dir, "tmp", e.Name()))
 		}
 	}
-	return &spool{dir: dir}, nil
+	return &spool{dir: dir, maxBytes: maxBytes}, nil
 }
 
 // enqueue makes body durable in every queue. On error, links already made
@@ -61,9 +64,50 @@ func (s *spool) enqueue(body []byte, gzipped bool, queues []*queue) error {
 		if err := syncDir(q.dir); err != nil {
 			errs = append(errs, err)
 		}
-		q.added()
+		q.added(int64(len(body)))
 	}
+	s.enforceSize()
 	return errors.Join(errs...)
+}
+
+func (s *spool) totalBytes() int64 {
+	var n int64
+	for _, q := range s.queues {
+		n += q.bytes.Load()
+	}
+	return n
+}
+
+// enforceSize drops the oldest batches, whichever queue they are in, until the
+// total is within maxBytes. A batch queued for several LAPIs is one file on
+// disk but counts once per LAPI, so real disk use stays at or below the limit.
+func (s *spool) enforceSize() {
+	if s.maxBytes <= 0 || s.totalBytes() <= s.maxBytes {
+		return
+	}
+	s.evictMu.Lock()
+	defer s.evictMu.Unlock()
+	type entry struct {
+		name string
+		q    *queue
+	}
+	var all []entry
+	for _, q := range s.queues {
+		names, err := q.list()
+		if err != nil {
+			continue
+		}
+		for _, n := range names {
+			all = append(all, entry{n, q})
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].name < all[j].name })
+	for _, e := range all {
+		if s.totalBytes() <= s.maxBytes {
+			return
+		}
+		e.q.remove(e.name, "overflow")
+	}
 }
 
 func writeSync(path string, b []byte) error {
@@ -102,6 +146,7 @@ type queue struct {
 	log     *slog.Logger
 
 	depth     atomic.Int64
+	bytes     atomic.Int64
 	up        atomic.Bool
 	delivered atomic.Uint64
 	mu        sync.Mutex
@@ -120,15 +165,35 @@ func newQueue(root string, sess *session, maxN int, maxAge time.Duration) (*queu
 		dropped: map[string]uint64{},
 		log:     slog.With("lapi", sess.lapi.name, "agent", sess.agent.cfg.Login),
 	}
-	names, err := q.list()
+	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
-	q.depth.Store(int64(len(names)))
-	if len(names) > 0 {
-		q.log.Info("pending batches from before restart", "depth", len(names))
+	var n, size int64
+	for _, e := range ents {
+		if !isBatch(e) {
+			q.log.Warn("ignoring unexpected file in queue", "file", e.Name())
+			continue
+		}
+		if fi, err := e.Info(); err == nil {
+			n++
+			size += fi.Size()
+		}
+	}
+	q.depth.Store(n)
+	q.bytes.Store(size)
+	if n > 0 {
+		q.log.Info("pending batches from before restart", "depth", n, "bytes", size)
+	}
+	if maxN > 0 && n > int64(maxN) {
+		q.trim()
 	}
 	return q, nil
+}
+
+func isBatch(e os.DirEntry) bool {
+	n := e.Name()
+	return e.Type().IsRegular() && (strings.HasSuffix(n, ".json") || strings.HasSuffix(n, ".json.gz"))
 }
 
 func (q *queue) list() ([]string, error) {
@@ -138,15 +203,16 @@ func (q *queue) list() ([]string, error) {
 	}
 	var names []string
 	for _, e := range ents {
-		if n := e.Name(); e.Type().IsRegular() && (strings.HasSuffix(n, ".json") || strings.HasSuffix(n, ".json.gz")) {
-			names = append(names, n)
+		if isBatch(e) {
+			names = append(names, e.Name())
 		}
 	}
 	sort.Strings(names)
 	return names, nil
 }
 
-func (q *queue) added() {
+func (q *queue) added(size int64) {
+	q.bytes.Add(size)
 	if q.depth.Add(1) > int64(q.maxN) && q.maxN > 0 {
 		q.trim()
 	}
@@ -168,13 +234,19 @@ func (q *queue) trim() {
 }
 
 func (q *queue) remove(name, dropReason string) {
-	if err := os.Remove(filepath.Join(q.dir, name)); err != nil {
+	path := filepath.Join(q.dir, name)
+	fi, err := os.Stat(path)
+	if err == nil {
+		err = os.Remove(path)
+	}
+	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			q.log.Error("removing queued batch", "file", name, "err", err)
 		}
 		return
 	}
 	q.depth.Add(-1)
+	q.bytes.Add(-fi.Size())
 	if dropReason != "" {
 		q.mu.Lock()
 		q.dropped[dropReason]++
@@ -286,4 +358,62 @@ func (q *queue) run(ctx context.Context) {
 			backoff = min(backoff*2, maxBackoff)
 		}
 	}
+}
+
+type orphanQueue struct {
+	path    string
+	batches int
+	bytes   int64
+}
+
+// checkOrphanQueues finds queue directories that no configured agent and LAPI
+// pair uses, e.g. after one was renamed or removed. Empty ones are removed.
+// The rest are deleted if prune is set, otherwise logged and returned.
+func checkOrphanQueues(root string, inUse map[string]bool, prune bool) ([]orphanQueue, error) {
+	lapiDirs, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+	var left []orphanQueue
+	for _, ld := range lapiDirs {
+		if !ld.IsDir() || ld.Name() == "tmp" {
+			continue
+		}
+		lp := filepath.Join(root, ld.Name())
+		agentDirs, err := os.ReadDir(lp)
+		if err != nil {
+			return nil, err
+		}
+		for _, ad := range agentDirs {
+			p := filepath.Join(lp, ad.Name())
+			if inUse[p] {
+				continue
+			}
+			o := orphanQueue{path: p}
+			filepath.WalkDir(p, func(_ string, d os.DirEntry, err error) error {
+				if err == nil && !d.IsDir() {
+					o.batches++
+					if fi, err := d.Info(); err == nil {
+						o.bytes += fi.Size()
+					}
+				}
+				return nil
+			})
+			switch {
+			case o.batches == 0:
+				os.RemoveAll(p)
+			case prune:
+				if err := os.RemoveAll(p); err != nil {
+					return nil, err
+				}
+				slog.Warn("deleted queue that is not in the config", "path", p, "batches", o.batches, "bytes", o.bytes)
+			default:
+				slog.Warn("queue is not in the config, its batches will not be delivered (set prune_orphan_queues to delete it)",
+					"path", p, "batches", o.batches, "bytes", o.bytes)
+				left = append(left, o)
+			}
+		}
+		os.Remove(lp) // only succeeds once nothing is left in it
+	}
+	return left, nil
 }

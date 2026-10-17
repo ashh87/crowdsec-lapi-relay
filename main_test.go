@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -172,6 +173,12 @@ func startRelay(t *testing.T, cfg *Config) *testRelay {
 	if err := cfg.validate(); err != nil {
 		t.Fatal(err)
 	}
+	return startValidated(t, cfg)
+}
+
+// startValidated skips validate, for limits too small to be allowed in a config.
+func startValidated(t *testing.T, cfg *Config) *testRelay {
+	t.Helper()
 	r, err := newRelay(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -456,11 +463,126 @@ func TestQueueLimits(t *testing.T) {
 	// Batches past max_queue_age are dropped rather than replayed.
 	old := fmt.Sprintf("%020d-00000000.json", time.Now().Add(-8*24*time.Hour).UnixNano())
 	os.WriteFile(filepath.Join(q.dir, old), alertBody("stale"), 0o600)
-	q.depth.Add(1)
-	q.added()
+	q.added(int64(len(alertBody("stale"))))
 	eventually(t, "stale batch dropped", func() bool { return q.droppedCounts()["expired"] == 1 })
 	if n := len(l1.received()); n != 2 {
 		t.Errorf("stale batch was delivered")
+	}
+}
+
+func TestQueueByteLimit(t *testing.T) {
+	l1 := newMockLAPI(t, bothAgents)
+	l1.setDown(true)
+	dir := t.TempDir()
+	cfg := testConfig(dir, l1)
+	if err := cfg.validate(); err != nil {
+		t.Fatal(err)
+	}
+	size := int64(len(alertBody("a1")))
+	cfg.MaxQueueBytes = ByteSize(3 * size)
+	tr := startValidated(t, cfg)
+	ta, tb := tr.login(t, "agent-a", "pw-a"), tr.login(t, "agent-b", "pw-b")
+	for _, p := range []struct{ tok, s string }{{ta, "a1"}, {ta, "a2"}, {tb, "b1"}, {ta, "a3"}, {tb, "b2"}} {
+		if code := tr.post(t, p.tok, alertBody(p.s), false); code != http.StatusCreated {
+			t.Fatalf("post %s: HTTP %d", p.s, code)
+		}
+	}
+	qa, qb := tr.r.agents["agent-a"].queues[0], tr.r.agents["agent-b"].queues[0]
+	// b2 pushed out a2, the oldest batch overall, although it is agent-a's.
+	if got := tr.r.spool.totalBytes(); got != 3*size {
+		t.Errorf("total bytes = %d, want %d", got, 3*size)
+	}
+	if d := qa.droppedCounts()["overflow"]; d != 2 {
+		t.Errorf("agent-a overflow drops = %d, want 2", d)
+	}
+	if d := qb.droppedCounts()["overflow"]; d != 0 {
+		t.Errorf("agent-b overflow drops = %d, want 0", d)
+	}
+
+	// Accounting after a restart comes from the files on disk.
+	tr.stop()
+	tr = startValidated(t, cfg)
+	qa, qb = tr.r.agents["agent-a"].queues[0], tr.r.agents["agent-b"].queues[0]
+	if qa.bytes.Load() != size || qb.bytes.Load() != 2*size {
+		t.Errorf("after restart bytes = %d/%d, want %d/%d", qa.bytes.Load(), qb.bytes.Load(), size, 2*size)
+	}
+
+	l1.setDown(false)
+	qa.signalRecovered()
+	qb.signalRecovered()
+	eventually(t, "delivery", func() bool { return len(l1.received()) == 3 })
+	var got []string
+	for _, a := range l1.received() {
+		got = append(got, a.scenario)
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != "a3,b1,b2" {
+		t.Errorf("delivered %v, want a3 b1 b2", got)
+	}
+	eventually(t, "queues empty", func() bool { return tr.r.spool.totalBytes() == 0 })
+}
+
+func TestOrphanQueues(t *testing.T) {
+	l1 := newMockLAPI(t, bothAgents)
+	dir := t.TempDir()
+	stale := []string{
+		filepath.Join(dir, "lapi-removed", "agent-a", "1-1.json"),
+		filepath.Join(dir, "lapi1", "agent-renamed", "1-1.json"),
+		filepath.Join(dir, "lapi1", "agent-renamed", "2-1.json"),
+	}
+	for _, p := range stale {
+		os.MkdirAll(filepath.Dir(p), 0o700)
+		os.WriteFile(p, alertBody("old"), 0o600)
+	}
+	empty := filepath.Join(dir, "lapi1", "agent-empty")
+	os.MkdirAll(empty, 0o700)
+
+	tr := startRelay(t, testConfig(dir, l1))
+	if tr.r.orphanBatches != 3 {
+		t.Errorf("orphanBatches = %d, want 3", tr.r.orphanBatches)
+	}
+	for _, p := range stale {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s was deleted without prune_orphan_queues", p)
+		}
+	}
+	if _, err := os.Stat(empty); !os.IsNotExist(err) {
+		t.Errorf("empty orphan queue was not removed")
+	}
+	tr.stop()
+
+	cfg := testConfig(dir, l1)
+	cfg.PruneOrphanQueues = true
+	tr = startRelay(t, cfg)
+	if tr.r.orphanBatches != 0 {
+		t.Errorf("orphanBatches = %d after pruning, want 0", tr.r.orphanBatches)
+	}
+	for _, p := range []string{filepath.Join(dir, "lapi-removed"), filepath.Join(dir, "lapi1", "agent-renamed")} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s was not pruned", p)
+		}
+	}
+	for _, agent := range []string{"agent-a", "agent-b"} {
+		if _, err := os.Stat(filepath.Join(dir, "lapi1", agent)); err != nil {
+			t.Errorf("configured queue removed: %v", err)
+		}
+	}
+}
+
+func TestByteSize(t *testing.T) {
+	for in, want := range map[string]int64{
+		`1048576`: 1 << 20, `"1GiB"`: 1 << 30, `"100 MB"`: 100e6, `"2gb"`: 2e9, `"512"`: 512,
+	} {
+		var b ByteSize
+		if err := json.Unmarshal([]byte(in), &b); err != nil || int64(b) != want {
+			t.Errorf("%s: got %d, %v; want %d", in, b, err, want)
+		}
+	}
+	for _, in := range []string{`"10XB"`, `"-1GiB"`, `"GiB"`, `"99999999999TiB"`, `true`} {
+		var b ByteSize
+		if err := json.Unmarshal([]byte(in), &b); err == nil {
+			t.Errorf("%s: no error, got %d", in, b)
+		}
 	}
 }
 
@@ -524,6 +646,10 @@ func TestConfigValidation(t *testing.T) {
 		{"public", func(c *Config) { c.Listen = "8.8.8.8:8081" }, "not a loopback"},
 		{"public allowed", func(c *Config) { c.Listen = "0.0.0.0:8081"; c.AllowPublicListen = true }, ""},
 		{"no lapis", func(c *Config) { c.LAPIs = nil }, "lapis is required"},
+		{"queue bytes too small", func(c *Config) {
+			c.LAPIs = append(c.LAPIs, UpstreamConfig{Name: "lapi-b", URL: "http://lapi-b.example:8080/"})
+			c.MaxQueueBytes = 40 << 20
+		}, "at least 64 MiB"},
 		{"bad url", func(c *Config) { c.LAPIs[0].URL = "100.1.1.1:8080" }, "must be http(s)"},
 		{"dup lapi", func(c *Config) { c.LAPIs = append(c.LAPIs, c.LAPIs[0]) }, "duplicate name"},
 		{"path in login", func(c *Config) { c.Agents[0].Login = "../etc" }, "must match"},

@@ -57,7 +57,14 @@ Delivery rules:
 - On any other 4xx, the batch is dropped and logged as `rejected`, so a poison batch can't block
   the queue.
 - `max_queue_files` (default 10000 per agent per LAPI) drops the oldest batch when exceeded.
-  `max_queue_age` (default 7 days) drops batches instead of replaying them.
+  `max_queue_bytes` (default 1 GiB across all queues) drops the oldest batches overall, whichever
+  agent or LAPI they belong to. `max_queue_age` (default 7 days) drops batches instead of
+  replaying them. Both limits are also applied at startup, so lowering them takes effect on restart.
+- **Queues no longer in the config.** If an agent or LAPI is renamed or removed, its queue folder
+  is no longer read. At startup the relay removes such folders when they are empty. Otherwise it
+  logs a warning for each one and reports the count in `lapi_relay_orphan_queue_batches`; with
+  `prune_orphan_queues` set it deletes them instead. To keep the batches after renaming an agent,
+  move the files into the new folder (`<queue_dir>/<lapi>/<new login>/`) before restarting.
 - **Replays don't extend bans.** The LAPI computes a decision's `until` as the alert's `stop_at`
   plus the profile duration, not from arrival time (`pkg/database/alerts.go`). This was checked in
   the integration test below. A late replay only adds alert history, which counts for profiles
@@ -116,6 +123,8 @@ JSON, unknown keys rejected. Run `lapi-relay -c config.json -check` to validate.
 | `queue_dir` | required | Fsynced, so put it on real storage. |
 | `max_queue_files` | 10000 | Per agent per LAPI. |
 | `max_queue_age` | `168h` | |
+| `max_queue_bytes` | `"1GiB"` | Total across all queues. A number of bytes or a string such as `"512MiB"` or `"2GB"`. A batch waiting for two LAPIs counts twice, although it is stored once, so disk use stays at or below this. Must be at least 32 MiB per LAPI so the largest batch the relay accepts fits. |
+| `prune_orphan_queues` | `false` | Delete queues for agents or LAPIs that are no longer in the config, instead of only warning. |
 | `token_ttl` | `1h` | Lifetime of tokens the relay issues to agents. |
 | `shutdown_grace` | `10s` | |
 | `agents[]` | required | `login`, `password` or `password_file`, and an optional `upstream: {<lapi>: {login, password/password_file}}`. |
@@ -125,9 +134,10 @@ Keep secrets in `password_file`s (mode 0640, `root:lapi-relay`), not in the JSON
 logs passwords or tokens. It does log failed login attempts with the machine ID and remote
 address.
 
-Metrics: `lapi_relay_queue_depth`, `lapi_relay_lapi_up`, `lapi_relay_delivered_total`,
+Metrics: `lapi_relay_queue_depth`, `lapi_relay_queue_bytes`, `lapi_relay_lapi_up`, `lapi_relay_delivered_total`,
 `lapi_relay_dropped_total{reason=overflow|expired|rejected}` (all labelled by `lapi` and `agent`),
-plus `lapi_relay_received_total` and `lapi_relay_failed_logins_total`. Non-empty queues are also
+plus `lapi_relay_received_total`, `lapi_relay_failed_logins_total` and
+`lapi_relay_orphan_queue_batches`. Non-empty queues are also
 logged once a minute.
 
 ## Running
@@ -177,7 +187,7 @@ docker run -d --name lapi-relay --restart unless-stopped \
    and consider allowlisting the proxies' own addresses on every LAPI.
 7. **Loss window.** An agent only gets 201 once the batch is fsynced into every LAPI's queue.
    After that, alerts are lost only if the relay's disk is lost, or a LAPI stays down past
-   `max_queue_age` or `max_queue_files`. Before the relay acknowledges a batch, the agent holds
+   `max_queue_age`, `max_queue_files` or `max_queue_bytes`. Before the relay acknowledges a batch, the agent holds
    it in memory and retries, which is the same as with a direct LAPI. **If a relay is down, no
    LAPI gets its agents' alerts**, so treat it like any other critical service and monitor
    `lapi_relay_lapi_up` and `lapi_relay_queue_depth`.

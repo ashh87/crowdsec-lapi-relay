@@ -3,6 +3,8 @@
   "queue_dir": "/var/lib/lapi-relay",
   "max_queue_files": 10000,
   "max_queue_age": "168h",
+  "max_queue_bytes": "1GiB",
+  "prune_orphan_queues": false,
   "token_ttl": "1h",
   "shutdown_grace": "10s",
 

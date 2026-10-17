@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -26,6 +28,39 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	*d = Duration(v)
+	return nil
+}
+
+// ByteSize reads a number of bytes, or a string like "512MiB" or "1GB".
+type ByteSize int64
+
+var byteUnits = map[string]int64{
+	"": 1, "b": 1,
+	"kb": 1e3, "mb": 1e6, "gb": 1e9, "tb": 1e12,
+	"kib": 1 << 10, "mib": 1 << 20, "gib": 1 << 30, "tib": 1 << 40,
+}
+
+func (b *ByteSize) UnmarshalJSON(data []byte) error {
+	var n int64
+	if err := json.Unmarshal(data, &n); err == nil {
+		*b = ByteSize(n)
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return errors.New("size must be a number of bytes or a string like \"1GiB\"")
+	}
+	s = strings.TrimSpace(s)
+	i := strings.IndexFunc(s, func(r rune) bool { return r < '0' || r > '9' })
+	if i < 0 {
+		i = len(s)
+	}
+	v, err := strconv.ParseInt(s[:i], 10, 64)
+	mult, ok := byteUnits[strings.ToLower(strings.TrimSpace(s[i:]))]
+	if err != nil || !ok || v > math.MaxInt64/mult {
+		return fmt.Errorf("size %q: want a number with an optional unit (B, KB, MB, GB, TB, KiB, MiB, GiB, TiB)", s)
+	}
+	*b = ByteSize(v * mult)
 	return nil
 }
 
@@ -48,6 +83,12 @@ type Config struct {
 	// late replay never extends a ban; it only adds alert history (which
 	// duration_expr profiles such as GetDecisionsCount do read).
 	MaxQueueAge Duration `json:"max_queue_age"`
+	// Total across all queues, counting a batch once per LAPI it waits for.
+	// Past this the oldest batches are dropped, whichever queue they are in.
+	MaxQueueBytes ByteSize `json:"max_queue_bytes"`
+	// Delete queues for agents or LAPIs that are no longer in the config,
+	// instead of only warning about them at startup.
+	PruneOrphanQueues bool `json:"prune_orphan_queues"`
 
 	TokenTTL      Duration `json:"token_ttl"`
 	ShutdownGrace Duration `json:"shutdown_grace"`
@@ -109,6 +150,9 @@ func (c *Config) validate() error {
 	if c.MaxQueueAge == 0 {
 		c.MaxQueueAge = Duration(7 * 24 * time.Hour)
 	}
+	if c.MaxQueueBytes == 0 {
+		c.MaxQueueBytes = 1 << 30
+	}
 	if c.TokenTTL == 0 {
 		c.TokenTTL = Duration(time.Hour)
 	}
@@ -132,6 +176,11 @@ func (c *Config) validate() error {
 
 	if len(c.LAPIs) == 0 {
 		errs = append(errs, errors.New("at least one entry in lapis is required"))
+	}
+	// The largest batch the relay accepts must fit, or it would be dropped
+	// right after the agent was told it was stored.
+	if minBytes := ByteSize(maxBodySize * max(len(c.LAPIs), 1)); c.MaxQueueBytes < minBytes {
+		errs = append(errs, fmt.Errorf("max_queue_bytes must be at least %d MiB (32 MiB per LAPI)", minBytes>>20))
 	}
 	lapis := map[string]bool{}
 	for i, u := range c.LAPIs {

@@ -100,6 +100,8 @@ type relay struct {
 
 	received atomic.Uint64
 	badLogin atomic.Uint64
+
+	orphanBatches int // in queues not in the config, as found at startup
 }
 
 type tokenInfo struct {
@@ -108,7 +110,7 @@ type tokenInfo struct {
 }
 
 func newRelay(cfg *Config) (*relay, error) {
-	sp, err := newSpool(cfg.QueueDir)
+	sp, err := newSpool(cfg.QueueDir, int64(cfg.MaxQueueBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -133,6 +135,20 @@ func newRelay(cfg *Config) (*relay, error) {
 			a.queues = append(a.queues, q)
 		}
 		r.agents[ac.Login] = a
+	}
+	sp.queues = r.allQueues()
+	sp.enforceSize() // the limit may have been lowered since the last run
+
+	inUse := map[string]bool{}
+	for _, q := range sp.queues {
+		inUse[q.dir] = true
+	}
+	orphans, err := checkOrphanQueues(cfg.QueueDir, inUse, cfg.PruneOrphanQueues)
+	if err != nil {
+		return nil, fmt.Errorf("checking for queues not in the config: %w", err)
+	}
+	for _, o := range orphans {
+		r.orphanBatches += o.batches
 	}
 	return r, nil
 }
@@ -451,6 +467,9 @@ func (r *relay) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	metric("lapi_relay_queue_depth", "gauge", "Alert batches waiting for delivery.", func(q *queue) {
 		fmt.Fprintf(&b, "lapi_relay_queue_depth{%s} %d\n", lbl(q), q.depth.Load())
 	})
+	metric("lapi_relay_queue_bytes", "gauge", "Size of the alert batches waiting for delivery.", func(q *queue) {
+		fmt.Fprintf(&b, "lapi_relay_queue_bytes{%s} %d\n", lbl(q), q.bytes.Load())
+	})
 	metric("lapi_relay_lapi_up", "gauge", "1 if the last delivery or heartbeat to this LAPI succeeded.", func(q *queue) {
 		v := 0
 		if q.up.Load() {
@@ -461,13 +480,14 @@ func (r *relay) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	metric("lapi_relay_delivered_total", "counter", "Alert batches delivered.", func(q *queue) {
 		fmt.Fprintf(&b, "lapi_relay_delivered_total{%s} %d\n", lbl(q), q.delivered.Load())
 	})
-	metric("lapi_relay_dropped_total", "counter", "Alert batches dropped (overflow, expired, rejected).", func(q *queue) {
+	metric("lapi_relay_dropped_total", "counter", "Alert batches dropped (overflow of max_queue_files or max_queue_bytes, expired, rejected).", func(q *queue) {
 		d := q.droppedCounts()
 		for _, reason := range []string{"expired", "overflow", "rejected"} {
 			fmt.Fprintf(&b, "lapi_relay_dropped_total{%s,reason=%q} %d\n", lbl(q), reason, d[reason])
 		}
 	})
 	fmt.Fprintf(&b, "# HELP lapi_relay_received_total Alert batches accepted from agents.\n# TYPE lapi_relay_received_total counter\nlapi_relay_received_total %d\n", r.received.Load())
+	fmt.Fprintf(&b, "# HELP lapi_relay_orphan_queue_batches Batches found at startup in queues that are not in the config.\n# TYPE lapi_relay_orphan_queue_batches gauge\nlapi_relay_orphan_queue_batches %d\n", r.orphanBatches)
 	fmt.Fprintf(&b, "# HELP lapi_relay_failed_logins_total Rejected agent logins.\n# TYPE lapi_relay_failed_logins_total counter\nlapi_relay_failed_logins_total %d\n", r.badLogin.Load())
 	io.WriteString(w, b.String())
 }
