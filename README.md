@@ -171,6 +171,16 @@ sudo scripts/install.sh --binary ./lapi-relay # use a binary built elsewhere
 sudo scripts/install.sh --uninstall [--purge] # --purge also deletes config and queue
 ```
 
+**Checking it works:** `journalctl -u lapi-relay -f`. When an agent logs in to the relay you
+should see `agent logged in`. Straight after that, the relay sends a heartbeat as that agent to
+each LAPI, and logs one line per LAPI:
+`LAPI reachable lapi=<name> agent=<id>`, or `LAPI unreachable, queueing ... err=...`. The error
+names the cause. For example, `login as <id>: HTTP 401` usually means the machine isn't
+registered on that LAPI (`cscli machines add <id> -p <password>`) or the password differs.
+Failing LAPIs are retried every minute; alerts for them stay queued and are delivered once they
+accept the login. On each LAPI, `cscli machines list` shows the agent's last heartbeat. The same
+state is on `/metrics` as `lapi_relay_lapi_up` and `lapi_relay_queue_depth`.
+
 **Updating** is the same command. The new version is checked against your config before anything
 is replaced. Queued alerts stay on disk across the restart. If the new version doesn't stay up,
 the previous one is put back. The config and password files are never overwritten. The unit file

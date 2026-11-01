@@ -98,6 +98,11 @@ type relay struct {
 	tokMu  sync.Mutex
 	tokens map[string]tokenInfo
 
+	// heartbeatNow runs a heartbeat round without waiting for the next tick,
+	// so the LAPIs see an agent (and the log shows whether they accept it)
+	// as soon as it logs in.
+	heartbeatNow chan struct{}
+
 	received atomic.Uint64
 	badLogin atomic.Uint64
 
@@ -114,7 +119,7 @@ func newRelay(cfg *Config) (*relay, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &relay{cfg: cfg, spool: sp, agents: map[string]*agentState{}, tokens: map[string]tokenInfo{}, start: time.Now()}
+	r := &relay{cfg: cfg, spool: sp, agents: map[string]*agentState{}, tokens: map[string]tokenInfo{}, start: time.Now(), heartbeatNow: make(chan struct{}, 1)}
 	for _, uc := range cfg.LAPIs {
 		l, err := newLAPI(uc)
 		if err != nil {
@@ -218,6 +223,10 @@ func (r *relay) handleLogin(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	a.updateLogin(in.Scenarios, req.UserAgent())
+	select {
+	case r.heartbeatNow <- struct{}{}:
+	default:
+	}
 
 	var raw [32]byte
 	rand.Read(raw[:])
@@ -406,6 +415,7 @@ func (r *relay) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		case <-r.heartbeatNow:
 		}
 	}
 }
@@ -424,10 +434,10 @@ func (r *relay) heartbeatRound(ctx context.Context) {
 			case err == nil && q.depth.Load() > 0:
 				q.signalRecovered()
 			case err == nil:
-				q.setUp(true)
+				q.setUp(true, nil)
 			case ctx.Err() == nil:
 				q.log.Debug("heartbeat failed", "err", err)
-				q.setUp(false)
+				q.setUp(false, err)
 			}
 		}
 	}

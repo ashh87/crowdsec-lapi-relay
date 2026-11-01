@@ -600,13 +600,60 @@ func TestHeartbeatAsAgent(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("heartbeat: HTTP %d", resp.StatusCode)
 	}
-	// The loop's first round runs at startup, before the agent was seen;
-	// run one round by hand rather than waiting a minute.
+	// The agent's login triggers a round; the next tick is a minute away.
+	eventually(t, "heartbeat as agent-a", func() bool {
+		l1.mu.Lock()
+		defer l1.mu.Unlock()
+		return l1.heartbeats["agent-a"] == 1
+	})
 	tr.r.heartbeatRound(context.Background())
 	l1.mu.Lock()
 	defer l1.mu.Unlock()
-	if l1.heartbeats["agent-a"] != 1 || l1.heartbeats["agent-b"] != 0 {
-		t.Errorf("heartbeats = %v, want one for the active agent only", l1.heartbeats)
+	if l1.heartbeats["agent-a"] != 2 || l1.heartbeats["agent-b"] != 0 {
+		t.Errorf("heartbeats = %v, want two for the active agent only", l1.heartbeats)
+	}
+}
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestLAPIStatusIsLogged(t *testing.T) {
+	logs := &syncBuffer{}
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil))) })
+
+	l1 := newMockLAPI(t, bothAgents)
+	l2 := newMockLAPI(t, map[string]string{"agent-b": "pw-b"}) // agent-a not registered
+	tr := startRelay(t, testConfig(t.TempDir(), l1, l2))
+	tr.login(t, "agent-a", "pw-a")
+	// The agent's login triggers a heartbeat round at once, and the first
+	// result per LAPI is logged even though nothing changed from "down".
+	eventually(t, "both LAPI results logged", func() bool {
+		s := logs.String()
+		return strings.Contains(s, `msg="LAPI reachable" lapi=lapi1 agent=agent-a`) &&
+			strings.Contains(s, `msg="LAPI unreachable, queueing" lapi=lapi2 agent=agent-a`)
+	})
+	if s := logs.String(); !strings.Contains(s, "login as agent-a: HTTP 401") {
+		t.Errorf("the refused login's error is not in the log:\n%s", s)
+	}
+	l1.mu.Lock()
+	defer l1.mu.Unlock()
+	if l1.heartbeats["agent-a"] != 1 {
+		t.Errorf("heartbeats = %v, want one for agent-a right after its login", l1.heartbeats)
 	}
 }
 

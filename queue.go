@@ -148,6 +148,7 @@ type queue struct {
 	depth     atomic.Int64
 	bytes     atomic.Int64
 	up        atomic.Bool
+	upKnown   atomic.Bool // false until the first delivery or heartbeat
 	delivered atomic.Uint64
 	mu        sync.Mutex
 	dropped   map[string]uint64 // reason -> count
@@ -271,13 +272,19 @@ func batchTime(name string) time.Time {
 	return time.Unix(0, ns)
 }
 
-func (q *queue) setUp(up bool) {
-	if q.up.Swap(up) != up {
-		if up {
-			q.log.Info("LAPI reachable", "pending", q.depth.Load())
-		} else {
-			q.log.Warn("LAPI unreachable, queueing", "pending", q.depth.Load())
-		}
+// setUp records whether the LAPI accepted the last delivery or heartbeat for
+// this agent. It logs the first result and every change, with err on failure
+// (e.g. the LAPI refusing the agent's login).
+func (q *queue) setUp(up bool, err error) {
+	changed := q.up.Swap(up) != up
+	first := !q.upKnown.Swap(true)
+	if !changed && !first {
+		return
+	}
+	if up {
+		q.log.Info("LAPI reachable", "login", q.sess.login, "pending", q.depth.Load())
+	} else {
+		q.log.Warn("LAPI unreachable, queueing", "login", q.sess.login, "pending", q.depth.Load(), "err", err)
 	}
 }
 
@@ -326,11 +333,11 @@ func (q *queue) run(ctx context.Context) {
 			case err == nil:
 				q.remove(name, "")
 				q.delivered.Add(1)
-				q.setUp(true)
+				q.setUp(true, nil)
 				backoff = minBackoff
 			case isRejected(err):
 				// Poison batch: keeping it would block everything behind it.
-				q.setUp(true)
+				q.setUp(true, nil)
 				q.log.Error("LAPI rejected batch, dropping it", "file", name, "err", err)
 				q.remove(name, "rejected")
 			default:
@@ -338,10 +345,7 @@ func (q *queue) run(ctx context.Context) {
 					return
 				}
 				q.log.Debug("delivery failed", "file", name, "err", err)
-				if q.up.Load() {
-					q.log.Warn("delivery failed", "err", err)
-				}
-				q.setUp(false)
+				q.setUp(false, err)
 				failed = true
 			}
 			if failed || ctx.Err() != nil {
