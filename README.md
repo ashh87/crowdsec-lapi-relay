@@ -254,3 +254,35 @@ Considered and rejected:
 - **Passing agent logins through to one "primary" LAPI.** Agents couldn't log in while that LAPI
   is down, and the other LAPIs would need a separate identity. `POST /v1/alerts` only accepts a
   machine JWT, not a bouncer API key.
+
+## Possible future work
+
+**De-duplicating signals to CAPI.** Every LAPI enrolled with CAPI shares signals from its own
+database. Behind the relay all LAPIs store the same alerts, so CAPI gets each signal once per
+LAPI. Turning sharing off on all but one LAPI (`api.server.online_client.sharing: false`) isn't a
+fix: a LAPI that doesn't share doesn't get the community blocklist either.
+
+An aggregator between the LAPIs and CAPI could share each signal once and hand the community
+blocklist to every LAPI. Each LAPI would point the `url` in its `online_api_credentials.yaml` at
+the aggregator, which speaks CAPI's v3 API to the LAPIs and holds the one real CAPI identity.
+What is known so far, from the CrowdSec source:
+- The CAPI address is configurable per LAPI (`url`, and `papi_url` for the Console's PAPI).
+- The LAPI routes to emulate: `/v3/watchers`, `/v3/watchers/login`, `/v3/watchers/enroll`,
+  `/v3/signals`, `/v3/decisions/stream`, `/v3/metrics`, `/v3/usage-metrics` and the heartbeat.
+- Duplicates have to be matched by content, not ID: each LAPI gives an alert a new UUID when
+  it stores it (`pkg/apiserver/controllers/v1/alerts.go`). The relay gives every LAPI
+  byte-identical alerts, so scenario, source, start/stop times and event count match.
+- The decision stream returns the full list on startup and changes after that, so the
+  aggregator has to keep the full set and track each LAPI's position in it.
+
+Open questions before building it:
+- Whether CrowdSec minds duplicate signals from one operator's engines at all.
+- Whether serving one engine's community blocklist to several of the same operator's LAPIs fits
+  their terms.
+- How to handle the v3 API changing, since it isn't a published, stable interface.
+- How to handle the aggregator being down: no blocklist updates, and signals must be queued.
+- Whether to proxy PAPI, so Console features keep working.
+
+It would be a separate project, not part of the relay. It sits elsewhere (between the LAPIs and
+the internet, one per fleet), speaks a different protocol and holds the real CAPI credentials,
+and would share almost no code with the relay.
