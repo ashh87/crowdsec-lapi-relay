@@ -39,7 +39,7 @@ alert under the machine from the JWT: it overwrites `alert.machine_id`
 
 | Endpoint | What the relay does |
 |---|---|
-| `POST /v1/watchers/login` | Checks the agent against `agents` and issues a relay token (`{"code":200,"expire":RFC3339,"token":…}`). A wrong password gets 401. |
+| `POST /v1/watchers/login` | Checks the agent against `agents` and issues a relay token (`{"code":200,"expire":RFC3339,"token":…}`). A wrong password gets 401. The body may be gzipped: the login carries the agent's scenarios and AppSec rules, so an agent with AppSec virtual patching sends a login over the client's 5 KB compression threshold. |
 | `POST /v1/alerts` | Validates that the body is a non-empty JSON array (gzip allowed). It writes the batch once, fsyncs it, hard-links it into every LAPI's queue for that agent, then answers `201 []`. If that fails it answers 503, and the agent re-queues the batch in memory. |
 | `GET /v1/heartbeat` | Answers 200 and marks the agent active. While an agent is active (seen in the last 5 minutes), the relay heartbeats every LAPI **as that agent** once a minute. |
 | `POST /v1/usage-metrics` | Forwarded to every LAPI as the agent, best effort, without queueing. These are periodic snapshots. |
@@ -91,6 +91,8 @@ Queue layout: `<queue_dir>/<lapi>/<agent>/<unixnano>-<seq>.json[.gz]`. Temporary
 **Tested against real CrowdSec** (built from `crowdsecurity/crowdsec` main at `9642ed6`,
 2026-10-16), using `scripts/integration-test.sh`. The setup was two LAPIs, the relay, and two
 real `crowdsec` agents tailing syslog files, each with its own machine ID:
+- One agent has AppSec virtual patching installed, so its login lists over 200 scenarios and
+  rules and is gzipped. Both LAPIs store the full list for that machine.
 - The `ssh-bf` and `ssh-bf_user-enum` scenarios fire. Both LAPIs store the alerts and create ban
   decisions, attributed to the right machine (`agent-a` or `agent-b`).
 - With LAPI2 stopped, LAPI1 keeps deciding, the agent sees no error, and LAPI2's batch is queued

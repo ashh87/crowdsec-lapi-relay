@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-var version = "0.3.0"
+var version = "0.3.1"
 
 func main() {
 	cfgPath := flag.String("c", "/etc/lapi-relay/config.json", "config file")

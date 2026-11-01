@@ -219,10 +219,16 @@ func (r *relay) handleLogin(w http.ResponseWriter, req *http.Request) {
 		Scenarios []string `json:"scenarios"`
 	}
 	body, err := readBody(req)
+	if err == nil && strings.EqualFold(req.Header.Get("Content-Encoding"), "gzip") {
+		// The CrowdSec client gzips any body over 5 KB, which includes the
+		// login of an agent with a long scenario list.
+		body, err = gunzip(body)
+	}
 	if err == nil {
 		err = json.Unmarshal(body, &in)
 	}
 	if err != nil {
+		slog.Warn("unreadable agent login", "remote", req.RemoteAddr, "err", err)
 		writeJSON(w, http.StatusBadRequest, map[string]any{"code": 400, "message": "bad request"})
 		return
 	}
@@ -317,6 +323,18 @@ func (r *relay) handleAlerts(w http.ResponseWriter, req *http.Request, a *agentS
 	// The LAPI answers with the new alert IDs. These are per LAPI and the
 	// agent ignores them, so return none rather than invent some.
 	writeJSON(w, http.StatusCreated, []string{})
+}
+
+func gunzip(b []byte) ([]byte, error) {
+	zr, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		return nil, fmt.Errorf("bad gzip body: %w", err)
+	}
+	out, err := io.ReadAll(io.LimitReader(zr, maxDecompressedHdr+1))
+	if err == nil && len(out) > maxDecompressedHdr {
+		err = errors.New("gzip body too large")
+	}
+	return out, err
 }
 
 // countAlerts checks the body is a JSON array of objects.

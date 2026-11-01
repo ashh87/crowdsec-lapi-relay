@@ -734,6 +734,43 @@ func TestLAPIStatusIsLogged(t *testing.T) {
 	}
 }
 
+// An agent with many scenarios sends a login over 5 KB, which the CrowdSec
+// client gzips.
+func TestGzippedLogin(t *testing.T) {
+	l1 := newMockLAPI(t, bothAgents)
+	tr := startRelay(t, testConfig(t.TempDir(), l1))
+	var scenarios []string
+	for i := range 300 {
+		scenarios = append(scenarios, fmt.Sprintf("crowdsecurity/some-long-scenario-name-%03d", i))
+	}
+	body, _ := json.Marshal(map[string]any{"machine_id": "agent-a", "password": "pw-a", "scenarios": scenarios})
+	if len(body) <= 5<<10 {
+		t.Fatalf("login body is only %d bytes; the client gzips above 5 KB", len(body))
+	}
+	req, _ := http.NewRequest(http.MethodPost, tr.url+"/v1/watchers/login", bytes.NewReader(gzipped(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+	req.Header.Set("User-Agent", "crowdsec/v1.7.0-test")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("gzipped login: HTTP %d, want 200", resp.StatusCode)
+	}
+	if sc, _, _ := tr.r.agents["agent-a"].loginInfo(); len(sc) != 300 {
+		t.Errorf("relay kept %d scenarios, want 300", len(sc))
+	}
+	// And they reach the LAPI on the relay's own login there.
+	tr.r.heartbeatRound(context.Background())
+	l1.mu.Lock()
+	defer l1.mu.Unlock()
+	if n := len(l1.logins); n == 0 || len(l1.logins[n-1].scenarios) != 300 {
+		t.Errorf("upstream login did not carry the 300 scenarios: %+v", l1.logins)
+	}
+}
+
 func TestBadUserAgentFallsBack(t *testing.T) {
 	a := &agentState{}
 	a.updateLogin(nil, "Mozilla/5.0 (X11; Linux) Firefox/1")

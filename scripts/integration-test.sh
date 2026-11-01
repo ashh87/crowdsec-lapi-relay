@@ -5,7 +5,7 @@
 #   CROWDSEC_SRC=~/src/crowdsec scripts/integration-test.sh [workdir]
 #
 # CROWDSEC_SRC must be a crowdsec checkout after `make build` (BUILD_RE2_WASM=1
-# works without libre2-dev). Needs envsubst (gettext-base) and access to the
+# works without libre2-dev). Needs envsubst (gettext-base), python3 and access to the
 # CrowdSec hub. Everything runs on 127.0.0.1:8081/8082/8090 under workdir.
 # Nothing touches a system CrowdSec install.
 set -euo pipefail
@@ -42,6 +42,9 @@ env_tree() { # name
 cs() { local d=$1; shift; (cd "$W/$d" && timeout 20 ./cscli -c dev.yaml "$@" 2>/dev/null); }
 
 for n in lapi1 lapi2 agent-a agent-b; do env_tree "$n"; done
+# AppSec rules count towards the list an agent sends at login. With these,
+# agent-a's login is over 5 KB, so the CrowdSec client gzips it.
+cs agent-a collections install crowdsecurity/appsec-virtual-patching >/dev/null
 # cscli reads alerts/decisions through the API, and test_env.sh points every
 # tree's credentials at :8081, so lapi2's cscli must be redirected too.
 sed -i 's/127.0.0.1:8081/127.0.0.1:8082/' "$W/lapi2/dev.yaml" "$W/lapi2/config/local_api_credentials.yaml"
@@ -87,6 +90,8 @@ wait_until 30 "LAPI2 up" curl -sf 127.0.0.1:8082/health
 wait_until 10 "relay up" curl -sf 127.0.0.1:8090/health
 start_agent agent-a; start_agent agent-b
 wait_until 30 "agent-a login" grep -q 'agent logged in.*machine_id=agent-a' "$W/relay.log"
+grep 'agent logged in.*machine_id=agent-a' "$W/relay.log" | grep -qE 'scenarios=([2-9][0-9]{2}|[0-9]{4})' ||
+	fail "agent-a's login wasn't the large (gzipped) one this test expects"
 wait_until 30 "agent-b login" grep -q 'agent logged in.*machine_id=agent-b' "$W/relay.log"
 sleep 3 # tailers start at end of file
 
@@ -148,8 +153,17 @@ cs agent-a decisions add -i 203.0.113.9 -d 1h >/dev/null || fail "cscli via rela
 for n in lapi1 lapi2; do wait_until 30 "$n got the cscli decision" has_decision "$n" 203.0.113.9; done
 cs agent-a decisions delete -i 203.0.113.9 >/dev/null || fail "cscli via relay: decisions delete"
 for n in lapi1 lapi2; do ! has_decision "$n" 203.0.113.9 || fail "$n still has the deleted decision"; done
+# The machine's scenario list as stored by each LAPI (cscli doesn't show it).
+machine_scenarios() { # lapi machine
+	local db
+	db=$(sed -n 's/^ *db_path: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$W/$1/dev.yaml")
+	python3 -I -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("select scenarios from machines where machine_id=?", (sys.argv[2],)).fetchone()[0] or "")' "$db" "$2"
+}
 for n in lapi1 lapi2; do
-	cs "$n" machines inspect agent-a -H | grep -q ssh-bf || fail "$n lost agent-a's scenarios after cscli logged in as it"
+	sc=$(machine_scenarios "$n" agent-a)
+	case $sc in *crowdsecurity/ssh-bf*vpatch-* | *vpatch-*crowdsecurity/ssh-bf*) ;;
+	*) fail "$n doesn't have agent-a's full scenario list (from its gzipped login) after cscli logged in as it" ;;
+	esac
 done
 pass "cscli list, inspect, add and delete work through the relay"
 
