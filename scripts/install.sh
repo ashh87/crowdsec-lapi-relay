@@ -29,10 +29,10 @@ usage() { sed -n '2,14s/^# \{0,1\}//p' "$0"; exit "${1:-0}"; }
 die() { echo "error: $*" >&2; exit 1; }
 say() { echo "==> $*"; }
 
-# queue_dir from the config, if it has one (the relay itself validates it).
-config_queue_dir() {
+# A string setting from the config, if set (the relay itself validates it).
+config_value() {
 	[ -f "$CONFIG" ] || return 0
-	sed -n 's/.*"queue_dir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG" | head -n 1
+	sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$CONFIG" | head -n 1
 }
 
 binary=
@@ -63,7 +63,7 @@ if [ -n "$uninstall" ]; then
 	if [ -n "$have_systemd" ]; then
 		systemctl disable --now lapi-relay.service 2>/dev/null || true
 	fi
-	queue_dir=$(config_queue_dir)
+	queue_dir=$(config_value queue_dir)
 	rm -f "$BIN" "$BIN.prev" "$UNIT" "$DROPIN"
 	rmdir "$DROPIN_DIR" 2>/dev/null || true # keeps your own drop-ins
 	[ -z "$have_systemd" ] || systemctl daemon-reload
@@ -163,7 +163,7 @@ install -d -m 0700 -o "$USER_NAME" -g "$USER_NAME" "$STATE"
 
 # The unit makes the file system read-only apart from $STATE, so a different
 # queue_dir needs a drop-in.
-queue_dir=$(config_queue_dir)
+queue_dir=$(config_value queue_dir)
 if [ -n "$queue_dir" ] && [ "${queue_dir%/}" != "$STATE" ]; then
 	install -d -m 0700 -o "$USER_NAME" -g "$USER_NAME" "$queue_dir"
 	install -d -m 0755 "$DROPIN_DIR"
@@ -180,7 +180,9 @@ if [ -n "$new_config" ]; then
 	cat <<EOF
 
 Next steps:
-  1. Edit $CONFIG: your agents and LAPIs.
+  1. Edit $CONFIG: your agents and LAPIs, and "listen". It starts as
+     127.0.0.1:8081, which only agents on this host can reach. For agents on
+     other machines, use this host's LAN or VPN address.
   2. Put each password in its own file in $ETC, e.g.
        printf '%s' 'the-password' > $ETC/agent-1.password
   3. Run this script again. It fixes file permissions, checks the config
@@ -202,7 +204,12 @@ systemctl restart lapi-relay.service || true
 sleep 3 # a crash by now shows as failed or activating (Restart=)
 if systemctl is-active --quiet lapi-relay.service; then
 	rm -f "$BIN.prev"
-	say "lapi-relay $new_version is running"
+	listen=$(config_value listen)
+	say "lapi-relay $new_version is running on ${listen:-127.0.0.1:8081}"
+	case ${listen:-127.0.0.1:8081} in
+	127.* | localhost:* | "[::1]:"*)
+		say "that is loopback: only agents on this host can connect (change \"listen\" for others)" ;;
+	esac
 	exit 0
 fi
 
