@@ -164,7 +164,7 @@ logged once a minute.
 ## Running
 
 ```sh
-go build -o lapi-relay .            # Go >= 1.24, no dependencies
+go build -o lapi-relay .            # Go >= 1.22, no dependencies
 go test -race ./...
 CROWDSEC_SRC=~/src/crowdsec scripts/integration-test.sh   # optional, real CrowdSec
 ```

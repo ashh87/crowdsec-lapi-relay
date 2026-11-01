@@ -9,7 +9,7 @@
 # alerts are kept, and if it fails to start the previous version is put back.
 # Your config and password files are never overwritten.
 #
-# Without --binary the relay is built from this checkout, which needs Go >= 1.24.
+# Without --binary the relay is built from this checkout, which needs Go >= 1.22.
 # To install on a host without Go, build elsewhere and copy the binary over:
 #   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o lapi-relay .   # or arm64
 set -eu
