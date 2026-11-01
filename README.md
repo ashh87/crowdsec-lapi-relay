@@ -96,6 +96,9 @@ real `crowdsec` agents tailing syslog files, each with its own machine ID:
 - Usage metrics: the LAPI accepted them (201) through the relay.
 - Docker image: built (with the base image pulled from `mirror.gcr.io` because of Docker Hub rate
   limits) and run as non-root with a named volume; a queued batch was written.
+- `scripts/install.sh` under systemd (Debian 12 in a container): fresh install, first start,
+  update with a queued batch kept, automatic rollback when the new version fails to start, a
+  custom `queue_dir`, uninstall and purge.
 - `systemd-analyze verify` passes on the unit. TLS listener: checked with `curl` only.
 - Unit tests (`go test -race ./...`) against a mock LAPI cover the cases above, plus poison
   batches, upstream token expiry, queue limits (file count, age and total size), queues left over
@@ -112,7 +115,8 @@ real `crowdsec` agents tailing syslog files, each with its own machine ID:
 - An agent connecting to the relay over TLS. Only `curl` was used. The CrowdSec client should
   need `ca_cert_path` in `local_api_credentials.yaml` for a private CA.
 - AppSec (WAF) traffic through the allowlist passthrough.
-- The systemd unit on a real host (it was only linted), and long runs or large backlogs.
+- The systemd unit and install script on a real host rather than a container, distributions
+  other than Debian, and long runs or large backlogs.
 
 ## Configuration
 
@@ -151,9 +155,26 @@ go test -race ./...
 CROWDSEC_SRC=~/src/crowdsec scripts/integration-test.sh   # optional, real CrowdSec
 ```
 
-**systemd:** copy the binary to `/usr/local/bin`, create the `lapi-relay` system user, then install
-[`deploy/lapi-relay.service`](deploy/lapi-relay.service) and `/etc/lapi-relay/config.json`. The
-queue lives in `/var/lib/lapi-relay` (`StateDirectory`).
+**systemd:** run [`scripts/install.sh`](scripts/install.sh) as root from a checkout. It builds the
+relay (or takes a prebuilt one with `--binary PATH`, for hosts without Go), creates the
+`lapi-relay` system user, and installs the binary to `/usr/local/bin`, the unit
+([`deploy/lapi-relay.service`](deploy/lapi-relay.service)) and a starting
+`/etc/lapi-relay/config.json`. The first run stops there so you can edit the config and add
+password files. Run it again and it sets the permissions on the config and password files,
+checks the config as the service user, and starts the service. The queue lives in
+`/var/lib/lapi-relay` (`StateDirectory`). For a different `queue_dir` the script adds a systemd
+drop-in so the relay can write to it.
+
+```sh
+sudo scripts/install.sh                       # install, or update after a git pull
+sudo scripts/install.sh --binary ./lapi-relay # use a binary built elsewhere
+sudo scripts/install.sh --uninstall [--purge] # --purge also deletes config and queue
+```
+
+**Updating** is the same command. The new version is checked against your config before anything
+is replaced. Queued alerts stay on disk across the restart. If the new version doesn't stay up,
+the previous one is put back. The config and password files are never overwritten. The unit file
+is replaced on every run, so put local changes in a drop-in (`systemctl edit lapi-relay`).
 
 **Docker:** see the `Dockerfile`. Inside a container the relay must listen on `0.0.0.0:8081` with
 `allow_public_listen: true`, so publish the port on a private address only:
