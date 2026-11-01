@@ -44,8 +44,18 @@ alert under the machine from the JWT: it overwrites `alert.machine_id`
 | `GET /v1/heartbeat` | Answers 200 and marks the agent active. While an agent is active (seen in the last 5 minutes), the relay heartbeats every LAPI **as that agent** once a minute. |
 | `POST /v1/usage-metrics` | Forwarded to every LAPI as the agent, best effort, without queueing. These are periodic snapshots. |
 | `GET/HEAD /v1/allowlists…`, `POST /v1/allowlists/check` | Read-only passthrough to the first LAPI that answers, in config order. AppSec uses these. |
+| `GET /v1/alerts` | Passthrough to the first LAPI that answers. This is `cscli alerts list` and `cscli decisions list` on a host whose agent uses the relay (see below). |
+| `GET /v1/alerts/<id>`, `DELETE /v1/alerts/<id>`, `DELETE /v1/decisions/<id>` | First LAPI in `lapis` only, with no fallback: IDs differ between LAPIs, so another LAPI's record with the same ID is a different one. Answers 502 while that LAPI is down. |
+| `DELETE /v1/decisions`, `DELETE /v1/alerts` (by filter, e.g. `cscli decisions delete --ip …`) | Sent to every LAPI, so an unban isn't left undone on one. If only some succeed, the answer is 502 naming the ones that failed; run the command again once they're back. Not queued. |
 | `GET /metrics`, `GET /health` | Prometheus text and a liveness check. No authentication; bind the relay to a private address. |
-| anything else | `501`. The relay is not a LAPI for `cscli`. Run `cscli` on each LAPI. |
+| anything else | `501`. |
+
+**`cscli` on an agent host.** `cscli` reads the same `local_api_credentials.yaml` as the agent,
+so once the agent points at the relay, `cscli`'s alert and decision commands go through the relay
+too, with the agent's identity. Lists and inspects come from the first LAPI in `lapis`; put the
+host's own LAPI first. `cscli decisions add` is sent to every LAPI like any alert. Deletes by
+filter go to every LAPI and deletes by ID to the first only. Commands that work on the database
+directly (`cscli machines`, `cscli bouncers`) are unaffected.
 
 Delivery rules:
 - Bodies are forwarded byte-for-byte with their `Content-Encoding`. The CrowdSec client gzips
@@ -94,6 +104,10 @@ real `crowdsec` agents tailing syslog files, each with its own machine ID:
   relay. The allowlist passthrough answered `GET`/`HEAD /v1/allowlists/check/<ip>` and
   `GET /v1/allowlists` from a real LAPI.
 - Usage metrics: the LAPI accepted them (201) through the relay.
+- `cscli` run with the agent's credentials, so through the relay: `alerts list`, `alerts inspect`
+  and `decisions list` answered from LAPI1; `decisions add` reached both LAPIs; `decisions delete
+  --ip` removed the decision from both. The agent's scenario list on each LAPI was unchanged
+  afterwards.
 - Docker image: built (with the base image pulled from `mirror.gcr.io` because of Docker Hub rate
   limits) and run as non-root with a named volume; a queued batch was written.
 - `scripts/install.sh` under systemd (Debian 12 in a container): fresh install, first start,
@@ -199,8 +213,9 @@ docker run -d --name lapi-relay --restart unless-stopped \
 
 1. **LAPIs.** Run one independent LAPI per host, each with its own database. Keep **profiles,
    allowlists and parser whitelists the same** on all of them, because each LAPI applies its own
-   when an alert arrives. Manual `cscli decisions add` and `cscli allowlists` changes are per LAPI
-   and are **not** replicated, so run them on every LAPI. Each LAPI enrolled with CAPI pulls the
+   when an alert arrives. `cscli allowlists` changes are per LAPI and are **not** replicated, so
+   run them on every LAPI. `cscli decisions add` and `delete` reach every LAPI only when run on a
+   host whose `cscli` goes through the relay (see "`cscli` on an agent host"). Each LAPI enrolled with CAPI pulls the
    community blocklist and shares signals independently.
 2. **Register every agent's machine on every LAPI** with the same ID and password:
    `cscli machines add <id> -p <password>`. Use `upstream` only if a LAPI needs different
@@ -208,7 +223,8 @@ docker run -d --name lapi-relay --restart unless-stopped \
    `new IP address detected for machine` once when the relay logs in. This is harmless.
 3. **Where to run relays.** Run a relay close to the agents it serves, so it stays reachable when
    a LAPI host is down:
-   - one relay per host that runs agents, listening on `127.0.0.1`, or
+   - one relay per host that runs agents, listening on `127.0.0.1`. If that host also runs a
+     LAPI, put it first in `lapis`, so `cscli` lists show that LAPI.
    - one relay for a group of agents on a LAN (a small VM or container), listening on its LAN or
      VPN address, with TLS if that network isn't trusted.
 4. **Point agents at the relay.** Set `url` in the agent's `local_api_credentials.yaml`, or the

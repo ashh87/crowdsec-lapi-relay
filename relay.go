@@ -82,6 +82,11 @@ func (a *agentState) updateLogin(scenarios []string, ua string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.lastSeen = time.Now()
+	// Like the LAPI, keep the known list when a login sends none: cscli logs
+	// in with the agent's credentials but without scenarios.
+	if len(scenarios) == 0 {
+		scenarios = a.scenarios
+	}
 	if !slices.Equal(scenarios, a.scenarios) || ua != a.userAgent {
 		a.scenarios, a.userAgent = scenarios, ua
 		a.gen++
@@ -177,6 +182,18 @@ func (r *relay) handler() http.Handler {
 	mux.HandleFunc("GET /v1/allowlists/{rest...}", r.auth(r.handlePassthrough))
 	mux.HandleFunc("HEAD /v1/allowlists/check/{rest...}", r.auth(r.handlePassthrough))
 	mux.HandleFunc("POST /v1/allowlists/check", r.auth(r.handlePassthrough))
+	// cscli on a host whose agent points at the relay shares the agent's
+	// credentials, so its alert and decision commands arrive here too.
+	// Listings fall back like the allowlists; anything naming a record by ID
+	// goes to the first LAPI only, because IDs differ between LAPIs. Deletes
+	// by filter (cscli decisions delete --ip ...) go to every LAPI, so an
+	// unban isn't left undone on one of them.
+	mux.HandleFunc("GET /v1/alerts", r.auth(r.handlePassthrough))
+	mux.HandleFunc("GET /v1/alerts/{id}", r.auth(r.handleFirstLAPI))
+	mux.HandleFunc("DELETE /v1/alerts/{id}", r.auth(r.handleFirstLAPI))
+	mux.HandleFunc("DELETE /v1/decisions/{id}", r.auth(r.handleFirstLAPI))
+	mux.HandleFunc("DELETE /v1/alerts", r.auth(r.handleDeleteEverywhere))
+	mux.HandleFunc("DELETE /v1/decisions", r.auth(r.handleDeleteEverywhere))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"status":"up"}`)
@@ -363,7 +380,19 @@ func (r *relay) handleUsageMetrics(w http.ResponseWriter, req *http.Request, a *
 	w.WriteHeader(http.StatusCreated)
 }
 
+// handlePassthrough forwards a read to the first LAPI that answers, in config
+// order.
 func (r *relay) handlePassthrough(w http.ResponseWriter, req *http.Request, a *agentState) {
+	r.forward(w, req, a, r.lapis)
+}
+
+// handleFirstLAPI forwards to the first LAPI only, with no fallback: the
+// request names a record by an ID that only means something there.
+func (r *relay) handleFirstLAPI(w http.ResponseWriter, req *http.Request, a *agentState) {
+	r.forward(w, req, a, r.lapis[:1])
+}
+
+func (r *relay) forward(w http.ResponseWriter, req *http.Request, a *agentState, lapis []*lapi) {
 	var body []byte
 	if req.Method == http.MethodPost {
 		var err error
@@ -380,27 +409,90 @@ func (r *relay) handlePassthrough(w http.ResponseWriter, req *http.Request, a *a
 	}
 	ctx, cancel := context.WithTimeout(req.Context(), 15*time.Second)
 	defer cancel()
-	for _, l := range r.lapis {
+	for _, l := range lapis {
 		resp, err := a.session[l.name].do(ctx, req.Method, req.URL.RequestURI(), body, h)
 		if err != nil {
-			slog.Debug("passthrough failed, trying next LAPI", "lapi", l.name, "path", req.URL.Path, "err", err)
+			slog.Debug("passthrough failed", "lapi", l.name, "path", req.URL.Path, "err", err)
 			continue
 		}
 		if resp.StatusCode >= 500 {
 			drain(resp)
 			continue
 		}
-		for _, k := range []string{"Content-Type", "Content-Encoding"} {
-			if v := resp.Header.Get(k); v != "" {
-				w.Header().Set(k, v)
-			}
-		}
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
-		resp.Body.Close()
+		copyResponse(w, resp)
+		return
+	}
+	if len(lapis) == 1 {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"message": "LAPI " + lapis[0].name + " is not reachable"})
 		return
 	}
 	writeJSON(w, http.StatusBadGateway, map[string]string{"message": "no LAPI reachable"})
+}
+
+func copyResponse(w http.ResponseWriter, resp *http.Response) {
+	defer resp.Body.Close()
+	for _, k := range []string{"Content-Type", "Content-Encoding"} {
+		if v := resp.Header.Get(k); v != "" {
+			w.Header().Set(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+// handleDeleteEverywhere sends a delete by filter to every LAPI. The agent
+// gets the first LAPI's answer when all succeed. When only some do, it gets
+// an error naming the ones that failed; the same command can be run again,
+// since deleting what is already gone is harmless.
+func (r *relay) handleDeleteEverywhere(w http.ResponseWriter, req *http.Request, a *agentState) {
+	h := http.Header{}
+	if v := req.Header.Get("Accept"); v != "" {
+		h.Set("Accept", v)
+	}
+	ctx, cancel := context.WithTimeout(req.Context(), 15*time.Second)
+	defer cancel()
+	var first *http.Response
+	var done, failed []string
+	for _, l := range r.lapis {
+		resp, err := a.session[l.name].do(ctx, req.Method, req.URL.RequestURI(), nil, h)
+		switch {
+		case err != nil:
+			failed = append(failed, l.name+": "+err.Error())
+		case resp.StatusCode >= 300:
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			failed = append(failed, fmt.Sprintf("%s: HTTP %d: %s", l.name, resp.StatusCode, snippet(b)))
+			if first == nil && len(done) == 0 {
+				// Keep it in case every LAPI refuses the same way (e.g. a bad filter).
+				resp.Body = io.NopCloser(bytes.NewReader(b))
+				first = resp
+			}
+			continue
+		default:
+			done = append(done, l.name)
+			if first == nil || first.StatusCode >= 300 {
+				first = resp
+				continue
+			}
+			drain(resp)
+		}
+	}
+	switch {
+	case len(failed) == 0:
+		copyResponse(w, first)
+	case len(done) == 0 && first != nil:
+		copyResponse(w, first)
+	default:
+		if first != nil {
+			first.Body.Close()
+		}
+		slog.Warn("delete did not reach every LAPI", "agent", a.cfg.Login, "path", req.URL.RequestURI(), "done", done, "failed", failed)
+		msg := "not deleted on " + strings.Join(failed, "; ")
+		if len(done) > 0 {
+			msg = "deleted on " + strings.Join(done, ", ") + ", but " + msg
+		}
+		writeJSON(w, http.StatusBadGateway, map[string]string{"message": msg + ". Run the command again once every LAPI is reachable."})
+	}
 }
 
 // heartbeatLoop keeps each LAPI's view of an agent current: while the agent

@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -39,6 +40,8 @@ type mockLAPI struct {
 	logins     []loginSeen
 	heartbeats map[string]int
 	n          int
+	label      string   // returned by reads, to tell LAPIs apart
+	requests   []string // reads and deletes, as "METHOD /path?query"
 }
 
 type postedAlert struct {
@@ -90,8 +93,8 @@ func (m *mockLAPI) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
-	switch r.URL.Path {
-	case "/v1/alerts":
+	switch r.Method + " " + r.URL.Path {
+	case "POST /v1/alerts":
 		var rd io.Reader = r.Body
 		gz := r.Header.Get("Content-Encoding") == "gzip"
 		if gz {
@@ -119,11 +122,28 @@ func (m *mockLAPI) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusCreated)
 		io.WriteString(w, `["1"]`)
-	case "/v1/heartbeat":
+	case "GET /v1/heartbeat":
 		m.heartbeats[machine]++
 	default:
-		w.WriteHeader(http.StatusNotFound)
+		m.requests = append(m.requests, r.Method+" "+r.URL.RequestURI())
+		switch {
+		case r.URL.Query().Has("bad"):
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `{"message":"bad filter"}`)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/alerts"):
+			fmt.Fprintf(w, `[{"id":1,"source":%q}]`, m.label)
+		case r.Method == http.MethodDelete:
+			fmt.Fprintf(w, `{"nbDeleted":"1","source":%q}`, m.label)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}
+}
+
+func (m *mockLAPI) seen() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.requests...)
 }
 
 func (m *mockLAPI) setDown(d bool) {
@@ -258,6 +278,19 @@ func (tr *testRelay) post(t *testing.T, token string, body []byte, gz bool) int 
 	}
 	resp.Body.Close()
 	return resp.StatusCode
+}
+
+func (tr *testRelay) call(t *testing.T, token, method, path string) (int, string) {
+	t.Helper()
+	req, _ := http.NewRequest(method, tr.url+path, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
 }
 
 func eventually(t *testing.T, what string, cond func() bool) {
@@ -614,6 +647,50 @@ func TestHeartbeatAsAgent(t *testing.T) {
 	}
 }
 
+// cscli on a host whose agent uses the relay sends its alert and decision
+// commands to the relay with the agent's credentials.
+func TestCscliCommands(t *testing.T) {
+	l1, l2 := newMockLAPI(t, bothAgents), newMockLAPI(t, bothAgents)
+	l1.label, l2.label = "lapi1", "lapi2"
+	tr := startRelay(t, testConfig(t.TempDir(), l1, l2))
+	tok := tr.login(t, "agent-a", "pw-a")
+	check := func(what string, code int, body string, wantCode int, wantBody string) {
+		t.Helper()
+		if code != wantCode || !strings.Contains(body, wantBody) {
+			t.Errorf("%s: HTTP %d %s, want %d containing %q", what, code, body, wantCode, wantBody)
+		}
+	}
+
+	code, body := tr.call(t, tok, "GET", "/v1/alerts?ip=192.0.2.1")
+	check("list", code, body, 200, `"source":"lapi1"`)
+	code, body = tr.call(t, tok, "DELETE", "/v1/decisions?ip=192.0.2.1")
+	check("delete by filter", code, body, 200, `"nbDeleted":"1"`)
+	for _, l := range []*mockLAPI{l1, l2} {
+		if got := l.seen(); !slices.Contains(got, "DELETE /v1/decisions?ip=192.0.2.1") {
+			t.Errorf("%s did not get the delete: %v", l.label, got)
+		}
+	}
+	code, body = tr.call(t, tok, "DELETE", "/v1/decisions?bad=1")
+	check("filter every LAPI refuses", code, body, 400, "bad filter")
+
+	l1.setDown(true)
+	code, body = tr.call(t, tok, "GET", "/v1/alerts")
+	check("list falls back", code, body, 200, `"source":"lapi2"`)
+	for _, path := range []string{"/v1/alerts/1", "/v1/decisions/1"} {
+		method := "DELETE"
+		if path == "/v1/alerts/1" {
+			method = "GET"
+		}
+		code, body = tr.call(t, tok, method, path)
+		check(method+" "+path+" without the first LAPI", code, body, 502, "lapi1 is not reachable")
+		if got := l2.seen(); slices.Contains(got, method+" "+path) {
+			t.Errorf("%s %s by ID reached lapi2, where the ID means another record", method, path)
+		}
+	}
+	code, body = tr.call(t, tok, "DELETE", "/v1/decisions?ip=192.0.2.2")
+	check("partial delete", code, body, 502, "deleted on lapi2, but not deleted on lapi1")
+}
+
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -668,6 +745,10 @@ func TestBadUserAgentFallsBack(t *testing.T) {
 	a.updateLogin([]string{"a", "b"}, "crowdsec/v1")
 	if a.generation() != gen+1 {
 		t.Errorf("same scenarios in another order forced a second upstream login")
+	}
+	a.updateLogin(nil, "crowdsec/v1") // cscli with the agent's credentials
+	if sc, _, _ := a.loginInfo(); !slices.Equal(sc, []string{"a", "b"}) || a.generation() != gen+1 {
+		t.Errorf("a login without scenarios changed them to %v (the LAPI keeps the old list)", sc)
 	}
 }
 

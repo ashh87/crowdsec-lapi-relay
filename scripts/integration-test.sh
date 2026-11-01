@@ -140,5 +140,18 @@ dec() { cs "$1" decisions list -a -o raw | awk -F, 'NR>1{print $3,$4,$5}' | sort
 diff <(dec lapi1) <(dec lapi2) || fail "decisions differ between LAPIs"
 pass "decisions match across LAPIs"
 
+# 6. cscli on an agent host goes through the relay, because it shares the
+# agent's credentials: lists come from the first LAPI, deletes reach both.
+[ "$(machine_of agent-a 192.0.2.10)" = agent-a ] || fail "cscli via relay: alerts list/inspect"
+has_decision agent-a 192.0.2.10 || fail "cscli via relay: decisions list"
+cs agent-a decisions add -i 203.0.113.9 -d 1h >/dev/null || fail "cscli via relay: decisions add"
+for n in lapi1 lapi2; do wait_until 30 "$n got the cscli decision" has_decision "$n" 203.0.113.9; done
+cs agent-a decisions delete -i 203.0.113.9 >/dev/null || fail "cscli via relay: decisions delete"
+for n in lapi1 lapi2; do ! has_decision "$n" 203.0.113.9 || fail "$n still has the deleted decision"; done
+for n in lapi1 lapi2; do
+	cs "$n" machines inspect agent-a -H | grep -q ssh-bf || fail "$n lost agent-a's scenarios after cscli logged in as it"
+done
+pass "cscli list, inspect, add and delete work through the relay"
+
 curl -s 127.0.0.1:8090/metrics | grep -E '^lapi_relay_(queue_depth|delivered_total|dropped_total)' || true
 echo "ALL PASSED"
