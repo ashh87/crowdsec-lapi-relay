@@ -24,7 +24,9 @@ alert under the machine from the JWT: it overwrites `alert.machine_id`
 (from usage metrics) and heartbeat, not "relay".
 
 - **Default:** the relay uses the same machine ID and password on every LAPI. Register the agent's
-  machine on each LAPI with `cscli machines add <id> -p <password>`.
+  machine on each LAPI with `cscli machines add <id> -p <password> -f /dev/null`. On a host that
+  already has `local_api_credentials.yaml`, cscli refuses without `-f`, and `--force` would
+  overwrite that host's own credentials with these.
 - **Per-LAPI override:** an agent's `upstream` map sets a different login per LAPI, for example if a
   machine ID already exists on one LAPI with a different password.
 - **Scenarios:** the agent's scenario list and User-Agent from its login are forwarded on the
@@ -196,7 +198,8 @@ should see `agent logged in`. Straight after that, the relay sends a heartbeat a
 each LAPI, and logs one line per LAPI:
 `LAPI reachable lapi=<name> agent=<id>`, or `LAPI unreachable, queueing ... err=...`. The error
 names the cause. For example, `login as <id>: HTTP 401` usually means the machine isn't
-registered on that LAPI (`cscli machines add <id> -p <password>`) or the password differs.
+registered on that LAPI (`cscli machines add <id> -p <password> -f /dev/null`) or the password
+differs.
 Failing LAPIs are retried every minute; alerts for them stay queued and are delivered once they
 accept the login. On each LAPI, `cscli machines list` shows the agent's last heartbeat. The same
 state is on `/metrics` as `lapi_relay_lapi_up` and `lapi_relay_queue_depth`.
@@ -224,7 +227,7 @@ docker run -d --name lapi-relay --restart unless-stopped \
    host whose `cscli` goes through the relay (see "`cscli` on an agent host"). Each LAPI enrolled with CAPI pulls the
    community blocklist and shares signals independently.
 2. **Register every agent's machine on every LAPI** with the same ID and password:
-   `cscli machines add <id> -p <password>`. Use `upstream` only if a LAPI needs different
+   `cscli machines add <id> -p <password> -f /dev/null`. Use `upstream` only if a LAPI needs different
    credentials. If an agent used to talk to a LAPI directly, the LAPI logs
    `new IP address detected for machine` once when the relay logs in. This is harmless.
 3. **Where to run relays.** Run a relay close to the agents it serves, so it stays reachable when
