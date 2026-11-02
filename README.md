@@ -107,6 +107,8 @@ real `crowdsec` agents tailing syslog files, each with its own machine ID:
   relay. The allowlist passthrough answered `GET`/`HEAD /v1/allowlists/check/<ip>` and
   `GET /v1/allowlists` from a real LAPI.
 - Usage metrics: the LAPI accepted them (201) through the relay.
+- AppSec on the agent with a bouncer key registered on LAPI1: a request with that key was
+  allowed (200), one with a wrong key refused (401), and a virtual-patching match blocked (403).
 - `cscli` run with the agent's credentials, so through the relay: `alerts list`, `alerts inspect`
   and `decisions list` answered from LAPI1; `decisions add` reached both LAPIs; `decisions delete
   --ip` removed the decision from both. The agent's scenario list on each LAPI was unchanged

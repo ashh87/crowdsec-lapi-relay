@@ -44,7 +44,8 @@ cs() { local d=$1; shift; (cd "$W/$d" && timeout 20 ./cscli -c dev.yaml "$@" 2>/
 for n in lapi1 lapi2 agent-a agent-b; do env_tree "$n"; done
 # AppSec rules count towards the list an agent sends at login. With these,
 # agent-a's login is over 5 KB, so the CrowdSec client gzips it.
-cs agent-a collections install crowdsecurity/appsec-virtual-patching >/dev/null
+(cd "$W/agent-a" && timeout 300 ./cscli -c dev.yaml collections install crowdsecurity/appsec-virtual-patching >/dev/null 2>&1) ||
+	fail "installing crowdsecurity/appsec-virtual-patching on agent-a"
 # cscli reads alerts/decisions through the API, and test_env.sh points every
 # tree's credentials at :8081, so lapi2's cscli must be redirected too.
 sed -i 's/127.0.0.1:8081/127.0.0.1:8082/' "$W/lapi2/dev.yaml" "$W/lapi2/config/local_api_credentials.yaml"
