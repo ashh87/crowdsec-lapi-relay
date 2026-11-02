@@ -42,6 +42,8 @@ type mockLAPI struct {
 	n          int
 	label      string   // returned by reads, to tell LAPIs apart
 	requests   []string // reads and deletes, as "METHOD /path?query"
+	bouncerKey string   // the one valid bouncer API key
+	keyChecks  int
 }
 
 type postedAlert struct {
@@ -86,6 +88,15 @@ func (m *mockLAPI) serve(w http.ResponseWriter, r *http.Request) {
 		m.tokens[tok] = in.MachineID
 		m.logins = append(m.logins, loginSeen{in.MachineID, r.UserAgent(), in.Scenarios})
 		fmt.Fprintf(w, `{"code":200,"expire":%q,"token":%q}`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339), tok)
+		return
+	}
+	if r.URL.Path == "/v1/decisions/stream" {
+		// Bouncer routes take an API key, not a machine token.
+		m.keyChecks++
+		if k := r.Header.Get("X-Api-Key"); k == "" || k != m.bouncerKey {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
 		return
 	}
 	machine, ok := m.tokens[strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")]
@@ -689,6 +700,39 @@ func TestCscliCommands(t *testing.T) {
 	}
 	code, body = tr.call(t, tok, "DELETE", "/v1/decisions?ip=192.0.2.2")
 	check("partial delete", code, body, 502, "deleted on lapi2, but not deleted on lapi1")
+}
+
+// AppSec checks each bouncer's API key with a HEAD to its agent's LAPI URL,
+// which is the relay. A refused check makes AppSec refuse the bouncer, and
+// Caddy's bouncer then answers every request with 500.
+func TestBouncerKeyCheck(t *testing.T) {
+	l1, l2 := newMockLAPI(t, bothAgents), newMockLAPI(t, bothAgents)
+	l1.bouncerKey = "caddy-key"
+	tr := startRelay(t, testConfig(t.TempDir(), l1, l2))
+	check := func(key string) int {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodHead, tr.url+"/v1/decisions/stream", nil)
+		req.Header.Set("X-Api-Key", key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if got := check("caddy-key"); got != http.StatusOK {
+		t.Errorf("valid key: HTTP %d, want 200", got)
+	}
+	if got := check("wrong"); got != http.StatusForbidden {
+		t.Errorf("wrong key: HTTP %d, want 403", got)
+	}
+	if l2.keyChecks != 0 {
+		t.Errorf("key checks reached lapi2 %d times; bouncer keys belong to the first LAPI", l2.keyChecks)
+	}
+	l1.setDown(true)
+	if got := check("caddy-key"); got == http.StatusOK {
+		t.Errorf("with the first LAPI down: HTTP 200, want an error")
+	}
 }
 
 type syncBuffer struct {

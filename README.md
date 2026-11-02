@@ -44,6 +44,7 @@ alert under the machine from the JWT: it overwrites `alert.machine_id`
 | `GET /v1/heartbeat` | Answers 200 and marks the agent active. While an agent is active (seen in the last 5 minutes), the relay heartbeats every LAPI **as that agent** once a minute. |
 | `POST /v1/usage-metrics` | Forwarded to every LAPI as the agent, best effort, without queueing. These are periodic snapshots. |
 | `GET/HEAD /v1/allowlists…`, `POST /v1/allowlists/check` | Read-only passthrough to the first LAPI that answers, in config order. AppSec uses these. |
+| `HEAD /v1/decisions/stream` (bouncer API key) | Forwarded with the bouncer's `X-Api-Key` to the first LAPI in `lapis` only, which answers 200 or 403. AppSec checks each bouncer's key this way, against its agent's LAPI URL, so without it AppSec refuses every bouncer and the web server answers with errors. Needs no relay token: the LAPI checks the key. Register those bouncers on the first LAPI (the host's own). |
 | `GET /v1/alerts` | Passthrough to the first LAPI that answers. This is `cscli alerts list` and `cscli decisions list` on a host whose agent uses the relay (see below). |
 | `GET /v1/alerts/<id>`, `DELETE /v1/alerts/<id>`, `DELETE /v1/decisions/<id>` | First LAPI in `lapis` only, with no fallback: IDs differ between LAPIs, so another LAPI's record with the same ID is a different one. Answers 502 while that LAPI is down. |
 | `DELETE /v1/decisions`, `DELETE /v1/alerts` (by filter, e.g. `cscli decisions delete --ip …`) | Sent to every LAPI, so an unban isn't left undone on one. If only some succeed, the answer is 502 naming the ones that failed; run the command again once they're back. Not queued. |
@@ -130,7 +131,8 @@ real `crowdsec` agents tailing syslog files, each with its own machine ID:
   HTTPS (`ca_file`).
 - An agent connecting to the relay over TLS. Only `curl` was used. The CrowdSec client should
   need `ca_cert_path` in `local_api_credentials.yaml` for a private CA.
-- AppSec (WAF) traffic through the allowlist passthrough.
+- AppSec with an allowlist entry, through the allowlist passthrough. A real web server bouncer
+  in front of AppSec (the test calls AppSec with `curl`).
 - The systemd unit and install script on a real host rather than a container, distributions
   other than Debian, and long runs or large backlogs.
 

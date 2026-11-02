@@ -182,6 +182,9 @@ func (r *relay) handler() http.Handler {
 	mux.HandleFunc("GET /v1/allowlists/{rest...}", r.auth(r.handlePassthrough))
 	mux.HandleFunc("HEAD /v1/allowlists/check/{rest...}", r.auth(r.handlePassthrough))
 	mux.HandleFunc("POST /v1/allowlists/check", r.auth(r.handlePassthrough))
+	// AppSec checks the API key of each bouncer that calls it with
+	// HEAD <agent's LAPI url>/v1/decisions/stream, which is the relay.
+	mux.HandleFunc("HEAD /v1/decisions/stream", r.handleBouncerKeyCheck)
 	// cscli on a host whose agent points at the relay shares the agent's
 	// credentials, so its alert and decision commands arrive here too.
 	// Listings fall back like the allowlists; anything naming a record by ID
@@ -408,6 +411,33 @@ func (r *relay) handlePassthrough(w http.ResponseWriter, req *http.Request, a *a
 // request names a record by an ID that only means something there.
 func (r *relay) handleFirstLAPI(w http.ResponseWriter, req *http.Request, a *agentState) {
 	r.forward(w, req, a, r.lapis[:1])
+}
+
+// handleBouncerKeyCheck forwards AppSec's bouncer API key check to the first
+// LAPI, which is where the bouncers in front of a local AppSec are registered.
+// It needs no relay token: the LAPI checks the key itself, and only the
+// status comes back.
+func (r *relay) handleBouncerKeyCheck(w http.ResponseWriter, req *http.Request) {
+	l := r.lapis[0]
+	ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
+	defer cancel()
+	up, err := http.NewRequestWithContext(ctx, http.MethodHead, l.base+"/v1/decisions/stream", http.NoBody)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	up.Header.Set("X-Api-Key", req.Header.Get("X-Api-Key"))
+	if ua := req.Header.Get("User-Agent"); ua != "" {
+		up.Header.Set("User-Agent", ua)
+	}
+	resp, err := l.client.Do(up)
+	if err != nil {
+		slog.Warn("bouncer key check failed", "lapi", l.name, "err", err)
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	drain(resp)
+	w.WriteHeader(resp.StatusCode)
 }
 
 func (r *relay) forward(w http.ResponseWriter, req *http.Request, a *agentState, lapis []*lapi) {

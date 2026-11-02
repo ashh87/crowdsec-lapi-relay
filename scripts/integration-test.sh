@@ -79,6 +79,10 @@ for a in agent-a agent-b; do
 	printf 'filenames:\n  - %s\nlabels:\n  type: syslog\n' "$W/logs/$a.log" >"$W/$a/config/acquis.yaml"
 	: >"$W/logs/$a.log"
 done
+# agent-a also runs AppSec, as on a host whose web server bouncer uses it.
+printf -- '---\nsource: appsec\nlisten_addr: 127.0.0.1:7422\nappsec_config: crowdsecurity/virtual-patching\nlabels:\n  type: appsec\n' >>"$W/agent-a/config/acquis.yaml"
+BOUNCER_KEY=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')
+cs lapi1 bouncers add web-bouncer -k "$BOUNCER_KEY" >/dev/null
 
 start_lapi() { (cd "$W/$1" && exec ./crowdsec -c dev.yaml -no-cs >>"$W/$1.log" 2>&1) & PIDS+=($!); eval "PID_$1=$!"; }
 start_relay() { "$W/lapi-relay" -c "$W/relay.json" -debug >>"$W/relay.log" 2>&1 & PIDS+=($!); PID_relay=$!; }
@@ -166,6 +170,24 @@ for n in lapi1 lapi2; do
 	esac
 done
 pass "cscli list, inspect, add and delete work through the relay"
+
+# 7. AppSec checks a bouncer's API key against its agent's LAPI URL (the
+# relay). If that check fails, AppSec refuses the bouncer with 401 and the web
+# server answers every request with an error.
+appsec() { # api-key uri -> HTTP status from AppSec
+	curl -s -o /dev/null -w '%{http_code}' 127.0.0.1:7422/ \
+		-H "X-Crowdsec-Appsec-Api-Key: $1" -H 'X-Crowdsec-Appsec-Ip: 192.0.2.50' \
+		-H "X-Crowdsec-Appsec-Uri: $2" -H 'X-Crowdsec-Appsec-Host: example.test' \
+		-H 'X-Crowdsec-Appsec-Verb: GET'
+}
+wait_until 30 "AppSec listening" sh -c "curl -s -o /dev/null 127.0.0.1:7422/"
+code=$(appsec "$BOUNCER_KEY" /index.html)
+[ "$code" = 200 ] || fail "AppSec with a valid bouncer key: HTTP $code, want 200"
+code=$(appsec wrong-key /index.html)
+[ "$code" = 401 ] || fail "AppSec with a wrong bouncer key: HTTP $code, want 401"
+code=$(appsec "$BOUNCER_KEY" '/.env')
+[ "$code" = 403 ] || fail "AppSec didn't block a virtual-patching request: HTTP $code, want 403"
+pass "AppSec checks bouncer keys through the relay, and blocks with a valid one"
 
 curl -s 127.0.0.1:8090/metrics | grep -E '^lapi_relay_(queue_depth|delivered_total|dropped_total)' || true
 echo "ALL PASSED"
