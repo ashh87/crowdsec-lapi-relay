@@ -8,6 +8,14 @@ decisions. Bouncers keep reading from their local LAPI.
 
 It is written in Go using only the standard library (about 1,300 lines plus tests).
 
+> [!WARNING]
+> **This project is entirely AI-written ("vibe-coded").** The code, tests and docs were written by
+> an AI coding assistant, directed and reviewed by a human but not written line by line by one.
+> It has unit tests and an integration test against real CrowdSec containers (see
+> [What was tested, and what is assumed](#what-was-tested-and-what-is-assumed)), but it has not
+> had an independent security review. It sits in the path of your security alerts, so read the
+> code and test it in your own setup before relying on it.
+
 ```
  agent A ─┐                        ┌─▶ LAPI 1 (own DB) ◀── bouncers on host 1
  agent B ─┼─▶ lapi-relay ─(queue)──┤
@@ -295,3 +303,8 @@ Open questions before building it:
 It would be a separate project, not part of the relay. It sits elsewhere (between the LAPIs and
 the internet, one per fleet), speaks a different protocol and holds the real CAPI credentials,
 and would share almost no code with the relay.
+
+## License
+
+MIT, see [LICENSE](LICENSE). The software is provided "as is", without warranty of any kind;
+the license text has the full disclaimer and limitation of liability.
