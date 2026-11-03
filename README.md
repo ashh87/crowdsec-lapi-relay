@@ -16,11 +16,52 @@ It is written in Go using only the standard library (about 1,300 lines plus test
 > had an independent security review. It sits in the path of your security alerts, so read the
 > code and test it in your own setup before relying on it.
 
+## Use case: a home lab behind more than one VPS
+
+The typical user is a homelabber who reaches their lab from outside through a VPS: the VPS runs
+a reverse proxy with a CrowdSec bouncer (often with AppSec), and forwards traffic over a VPN or
+tunnel to services at home. That VPS is a single point of failure, so a common next step is a
+second VPS somewhere else (another provider or region), with DNS failover or two A records in
+front of both.
+
+CrowdSec makes the second VPS awkward. Each bouncer reads from one LAPI, so either:
+
+- **both VPSs share one LAPI.** If the VPS hosting it goes down, the other VPS's bouncer loses
+  its decision source, which is exactly the failure the second VPS was meant to survive; or
+- **each VPS runs its own LAPI.** Then each only knows about the attacks it saw itself, and
+  the attacks seen by agents at home (application logs, SSH, and so on) only reach one of them.
+
+lapi-relay takes the second option and fixes its gap. Every agent, on either VPS or at home,
+sends its alerts through a relay that delivers them to **every** LAPI. Each VPS keeps its own
+LAPI and keeps protecting traffic with the full picture of what all agents saw, even while the
+other VPS, or the link between them, is down. Alerts for a LAPI that is unreachable are queued
+on disk and replayed when it comes back, so both LAPIs catch up afterwards.
+
 ```
- agent A ─┐                        ┌─▶ LAPI 1 (own DB) ◀── bouncers on host 1
- agent B ─┼─▶ lapi-relay ─(queue)──┤
- agent C ─┘                        └─▶ LAPI 2 (own DB) ◀── bouncers on host 2
+                 clients
+          ┌─────────┴─────────┐     DNS failover, or one A record per VPS
+          ▼                   ▼
+ ┌─────────────────┐ ┌─────────────────┐
+ │ VPS A           │ │ VPS B           │   each VPS: reverse proxy + bouncer,
+ │ proxy + LAPI A  │ │ proxy + LAPI B  │   its own LAPI, its own agent + relay
+ └────────┬────────┘ └────────┬────────┘
+          └─────────┬─────────┘
+                    │ VPN / tunnel
+          ┌─────────┴─────────┐
+          │ home lab          │   services, their agents, one relay
+          └───────────────────┘
 ```
+
+How the alerts flow:
+
+```
+ VPS A agent ──▶ relay on VPS A ─┐               ┌─▶ LAPI A (own DB) ◀── bouncer on VPS A
+ VPS B agent ──▶ relay on VPS B ─┼─▶ (queues) ───┤
+ home agents ──▶ relay at home  ─┘               └─▶ LAPI B (own DB) ◀── bouncer on VPS B
+```
+
+Nothing in the relay is specific to this layout: it works for any set of agents that should feed
+several independent LAPIs. Two LAPIs are shown, but `lapis` can list more.
 
 ## Machine identity: the LAPIs see which agent sent each alert
 
